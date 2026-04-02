@@ -1083,3 +1083,563 @@ class LRBFMStateModel(LSEMStateModel):
         model.Qz = model.cholvec_to_mat(model.Lz, model.Dz)
         model.update_state_density()
         return model
+
+
+class LSEMExogStateModel(LSEMStateModel):
+    r"""LSEM state model with exogenous inputs.
+
+    .. math::
+
+        Z_t = A_z Z_{t-1} + A_u u_t + A_k k(Z_{t-1}, u_t) + b + \zeta_t
+
+    The feature function is :math:`\phi(Z, u) = (Z, u, k(h_1(Z,u)), ..., k(h_n(Z,u)))^\top`
+    with :math:`h_i(Z, u) = w_i^{z,\top} Z + w_i^{u,\top} u + w_{i,0}`.
+
+    Since u is observed, at each time step this reduces to a standard LSEM with
+    time-varying bias and kernel offset:
+
+    - Effective bias: :math:`b_{eff}(u_t) = b + A^u u_t`
+    - Effective kernel offset: :math:`\tilde{w}_0(u_t) = W_u u_t + w_{0,base}`
+
+    :param Dz: Dimensionality of latent space.
+    :param Du: Dimensionality of exogenous input.
+    :param Dk: Number of squared exponential kernels.
+    :param noise_z: Initial isotropic std on state transition.
+    :param lambda_W: Regularization weight for kernel parameters.
+    :param delta: Numerical regularization.
+    :param key: Random key for initialization.
+    """
+
+    def __init__(
+        self,
+        Dz: int,
+        Du: int,
+        Dk: int,
+        noise_z: float = 1.0,
+        lambda_W: float = 0.0,
+        delta: float = 0.0,
+        key=random.PRNGKey(42),
+    ):
+        self.Dz, self.Du, self.Dk = Dz, Du, Dk
+        self.Dphi = self.Dz + self.Du + self.Dk
+        self.Qz = noise_z**2 * jnp.eye(self.Dz)
+        self.Lz = self.mat_to_cholvec(self.Qz)
+        self.lambda_W = lambda_W
+        # A: [Dz, Dz+Du+Dk] = [A_lin_z | A_lin_u | A_k]
+        key, subkey = random.split(key)
+        self.A = random.normal(subkey, (self.Dz, self.Dphi))
+        self.A = self.A.at[:, :self.Dz].set(jnp.eye(self.Dz))
+        self.A = self.A.at[:, self.Dz:self.Dz + self.Du].set(
+            jnp.zeros((self.Dz, self.Du))
+        )
+        self.b = jnp.zeros((self.Dz,))
+        # W: [Dk, 1+Dz+Du] = [w0_base | W_z | W_u]
+        key, subkey = random.split(key)
+        self.W = random.normal(subkey, (self.Dk, 1 + self.Dz + self.Du))
+        self.delta = delta
+        self.update_state_density()
+
+    @property
+    def A_lin_z(self):
+        return self.A[:, :self.Dz]
+
+    @property
+    def A_lin_u(self):
+        return self.A[:, self.Dz:self.Dz + self.Du]
+
+    @property
+    def A_k(self):
+        return self.A[:, self.Dz + self.Du:]
+
+    @property
+    def W_base(self):
+        """w0_base: [Dk]"""
+        return self.W[:, 0]
+
+    @property
+    def W_z(self):
+        """W_z: [Dk, Dz]"""
+        return self.W[:, 1:1 + self.Dz]
+
+    @property
+    def W_u(self):
+        """W_u: [Dk, Du]"""
+        return self.W[:, 1 + self.Dz:]
+
+    def update_state_density(self):
+        """Create base LSEMGaussianConditional operating only on z-space.
+
+        M_eff = [A_lin_z | A_k], shape [Dz, Dz+Dk]
+        W_base_z = [w0_base | W_z], shape [Dk, 1+Dz]
+        """
+        Sigma_z = self.Qz + self.delta * jnp.eye(self.Dz)
+        M_eff = jnp.concatenate([self.A_lin_z, self.A_k], axis=1)
+        W_base_z = jnp.concatenate([self.W_base[:, None], self.W_z], axis=1)
+        self.state_density = approximate_conditional.LSEMGaussianConditional(
+            M=jnp.array([M_eff]),
+            b=jnp.array([self.b]),
+            W=W_base_z,
+            Sigma=jnp.array([Sigma_z]),
+        )
+        self.Qz_inv, self.ln_det_Qz = (
+            self.state_density.Lambda[0],
+            self.state_density.ln_det_Sigma[0],
+        )
+
+    def _make_conditional_for_u(self, u_t):
+        """Create a temporary LSEMGaussianConditional with u_t-dependent parameters.
+
+        Given u_t [Du], returns conditional with:
+        - M_eff = [A_lin_z | A_k] (unchanged)
+        - b_eff = b + A_lin_u @ u_t
+        - w0_tilde = W_u @ u_t + w0_base, then W_eff = [w0_tilde | W_z]
+        """
+        b_eff = self.b + jnp.dot(self.A_lin_u, u_t)
+        w0_tilde = jnp.dot(self.W_u, u_t) + self.W_base
+        M_eff = jnp.concatenate([self.A_lin_z, self.A_k], axis=1)
+        W_eff = jnp.concatenate([w0_tilde[:, None], self.W_z], axis=1)
+        Sigma_z = self.Qz + self.delta * jnp.eye(self.Dz)
+        cond = approximate_conditional.LSEMGaussianConditional(
+            M=jnp.array([M_eff]),
+            b=jnp.array([b_eff]),
+            W=W_eff,
+            Sigma=jnp.array([Sigma_z]),
+        )
+        return cond
+
+    def _make_k_func_for_u(self, u_t):
+        """OneRankFactor for k(z, u_t) over z-space only.
+
+        v = W_z, nu = W_z * w0_tilde[:, None], ln_beta = -0.5 * w0_tilde^2
+        """
+        w0_tilde = jnp.dot(self.W_u, u_t) + self.W_base
+        v = self.W_z
+        nu = self.W_z * w0_tilde[:, None]
+        ln_beta = -0.5 * w0_tilde**2
+        return factor.OneRankFactor(v=v, nu=nu, ln_beta=ln_beta)
+
+    def _make_joint_k_func_for_u(self, u_t):
+        """OneRankFactor for k(z, u_t) over joint (z_{t+1}, z_t) space [2*Dz].
+
+        The kernel acts on z_t (second block), so v_joint has zeros in first Dz dims.
+        """
+        k_func = self._make_k_func_for_u(u_t)
+        zero_arr = jnp.zeros([self.Dk, 2 * self.Dz])
+        v_joint = zero_arr.at[:, self.Dz:].set(k_func.v)
+        nu_joint = zero_arr.at[:, self.Dz:].set(k_func.nu)
+        return factor.OneRankFactor(
+            v=v_joint, nu=nu_joint, ln_beta=k_func.ln_beta
+        )
+
+    # --- Forward/backward overrides ---
+
+    def prediction(
+        self, pre_filter_density: pdf.GaussianPDF, **kwargs
+    ) -> pdf.GaussianPDF:
+        u = kwargs.get("u", None)
+        if u is not None:
+            u_t = u.reshape(self.Du)
+            cond = self._make_conditional_for_u(u_t)
+            return cond.affine_marginal_transformation(pre_filter_density)
+        return self.state_density.affine_marginal_transformation(
+            pre_filter_density
+        )
+
+    def smoothing(
+        self,
+        cur_filter_density: pdf.GaussianPDF,
+        post_smoothing_density: pdf.GaussianPDF,
+        **kwargs,
+    ) -> Tuple[pdf.GaussianPDF, pdf.GaussianPDF]:
+        u = kwargs.get("u", None)
+        if u is not None:
+            u_t = u.reshape(self.Du)
+            cond = self._make_conditional_for_u(u_t)
+        else:
+            cond = self.state_density
+        backward_density = cond.affine_conditional_transformation(
+            cur_filter_density
+        )
+        cur_two_step_smoothing_density = (
+            backward_density.affine_joint_transformation(post_smoothing_density)
+        )
+        cur_smoothing_density = cur_two_step_smoothing_density.get_marginal(
+            jnp.arange(self.Dz, 2 * self.Dz)
+        )
+        return cur_smoothing_density, cur_two_step_smoothing_density
+
+    # --- Q-function ---
+
+    def compute_Q_function(
+        self,
+        smoothing_density: pdf.GaussianPDF,
+        two_step_smoothing_density: pdf.GaussianPDF,
+        **kwargs,
+    ) -> float:
+        control_z = kwargs.get("control_z", None)
+        if control_z is None or control_z.shape[-1] == 0:
+            return jnp.sum(
+                self.state_density.integrate_log_conditional(
+                    two_step_smoothing_density,
+                    p_x=smoothing_density.slice(
+                        jnp.arange(0, smoothing_density.R - 1)
+                    ),
+                )
+            )
+        T = two_step_smoothing_density.R
+
+        def _q_one_step(t):
+            u_t = control_z[t]
+            cond = self._make_conditional_for_u(u_t)
+            ts_density = two_step_smoothing_density.slice(jnp.array([t]))
+            px = smoothing_density.slice(jnp.array([t]))
+            return cond.integrate_log_conditional(
+                ts_density, p_x=px
+            ).squeeze()
+
+        q_vals = vmap(_q_one_step)(jnp.arange(T))
+        return jnp.sum(q_vals)
+
+    # --- M-step overrides ---
+
+    def update_hyperparameters(
+        self, smooth_dict: dict, two_step_smooth_dict: dict, **kwargs
+    ):
+        control_z = kwargs.get("control_z", None)
+        self.A = jit(self._update_A)(
+            smooth_dict, two_step_smooth_dict, control_z
+        )
+        self.Qz = jit(self._update_Qz)(
+            smooth_dict, two_step_smooth_dict, control_z
+        )
+        self.Lz = self.mat_to_cholvec(self.Qz)
+        self.b = jit(self._update_b)(smooth_dict, control_z)
+        self.update_state_density()
+        self._update_kernel_params(
+            smooth_dict, two_step_smooth_dict, control_z
+        )
+        self.update_state_density()
+
+    def _update_A(self, smooth_dict, two_step_smooth_dict, control_z):
+        stats = jit(vmap(self._get_A_stats))(
+            smooth_dict, two_step_smooth_dict, control_z
+        )
+        T, Eff, Ezf, Ef = self._reduce_batch_dims(stats)
+        Ebf = Ef[None] * self.b[:, None]
+        # Regularize kernel block
+        Eff = Eff.at[self.Dz + self.Du :, self.Dz + self.Du :].add(
+            1e-4 * jnp.eye(self.Dk)
+        )
+        A = jnp.linalg.solve(Eff / T, (Ezf - Ebf).T / T).T
+        return A
+
+    def _get_A_stats(self, smooth_dict, two_step_smooth_dict, control_z):
+        r"""Extended sufficient statistics for f = [z, u, k(z,u)].
+
+        .. math::
+
+            E_{ff'} = \begin{bmatrix} E[zz'] & E[z]u' & E[zk'] \\
+                                       u E[z]' & uu' & u E[k]' \\
+                                       E[kz'] & E[k]u' & E[kk'] \end{bmatrix}
+        """
+        two_step_smoothing_density = pdf.GaussianPDF(**two_step_smooth_dict)
+        T = two_step_smoothing_density.R
+        smoothing_density = pdf.GaussianPDF(**smooth_dict).slice(
+            jnp.arange(T)
+        )
+        U = control_z[:T]  # [T, Du]
+
+        # --- z-block stats ---
+        sum_Ezz = jnp.sum(
+            smoothing_density.integrate("xx'"), axis=0
+        )  # [Dz, Dz]
+        Ez_per_t = smoothing_density.integrate("x")  # [T, Dz]
+        sum_Ez = jnp.sum(Ez_per_t, axis=0)  # [Dz]
+
+        # --- u-block stats (deterministic) ---
+        sum_uu = jnp.einsum("ti,tj->ij", U, U)  # [Du, Du]
+        sum_uEz = jnp.einsum("ti,tj->ij", U, Ez_per_t)  # [Du, Dz]
+
+        # --- k-block stats (per-timestep, u-dependent) ---
+        def _k_stats_one_t(t):
+            u_t = U[t]
+            k_func = self._make_k_func_for_u(u_t)
+            sd_t = smoothing_density.slice(jnp.array([t]))
+            sd_k = sd_t.multiply(k_func, update_full=True)
+            sd_kk = sd_k.multiply(k_func, update_full=True)
+            Ek_t = sd_k.integral_light().reshape((self.Dk,))
+            Ekz_t = sd_k.integrate("x").reshape((self.Dk, self.Dz))
+            Ekk_t = sd_kk.integral_light().reshape((self.Dk, self.Dk))
+            return Ek_t, Ekz_t, Ekk_t
+
+        Ek_all, Ekz_all, Ekk_all = vmap(_k_stats_one_t)(jnp.arange(T))
+        sum_Ek = jnp.sum(Ek_all, axis=0)
+        sum_Ekz = jnp.sum(Ekz_all, axis=0)
+        sum_Ekk = jnp.sum(Ekk_all, axis=0)
+
+        # u-k cross: sum_t u_t * E[k_t]'
+        sum_uEk = jnp.einsum("ti,tj->ij", U, Ek_all)  # [Du, Dk]
+
+        # Ef = [sum_Ez, sum_u, sum_Ek]
+        sum_u = jnp.sum(U, axis=0)
+        Ef = jnp.concatenate([sum_Ez, sum_u, sum_Ek])
+
+        # Eff block matrix [Dz+Du+Dk, Dz+Du+Dk]
+        Eff = jnp.block([
+            [sum_Ezz, sum_uEz.T, sum_Ekz.T],
+            [sum_uEz, sum_uu, sum_uEk],
+            [sum_Ekz, sum_uEk.T, sum_Ekk],
+        ])
+
+        # --- Cross terms: E[z_{t+1} f(z_t, u_t)'] ---
+        Ezz_cross = jnp.sum(
+            two_step_smoothing_density.integrate("xx'")[
+                :, self.Dz :, : self.Dz
+            ],
+            axis=0,
+        )
+
+        Ez_future_per_t = (
+            pdf.GaussianPDF(**smooth_dict)
+            .slice(jnp.arange(1, T + 1))
+            .integrate("x")
+        )
+        sum_Ez_future_u = jnp.einsum(
+            "ti,tj->ij", Ez_future_per_t, U
+        )  # [Dz, Du]
+
+        def _cross_k_one_t(t):
+            u_t = U[t]
+            joint_k_func = self._make_joint_k_func_for_u(u_t)
+            ts_t = two_step_smoothing_density.slice(jnp.array([t]))
+            ts_k = ts_t.multiply(joint_k_func, update_full=True)
+            Ekz_joint = ts_k.integrate("x").reshape(
+                (self.Dk, 2 * self.Dz)
+            )
+            return Ekz_joint[:, : self.Dz]  # E[k(z_t,u_t) z_{t+1}]
+
+        Ek_future_all = vmap(_cross_k_one_t)(jnp.arange(T))
+        sum_Ek_future = jnp.sum(Ek_future_all, axis=0)  # [Dk, Dz]
+
+        Ezf = jnp.concatenate(
+            [Ezz_cross.T, sum_Ez_future_u, sum_Ek_future.T], axis=1
+        )
+
+        return jnp.array([T]), Eff, Ezf, Ef
+
+    def _update_b(self, smooth_dict, control_z):
+        stats = jit(vmap(self._get_b_stats))(smooth_dict, control_z)
+        T, Ef, sd_mu = self._reduce_batch_dims(stats)
+        b = sd_mu / T - jnp.dot(self.A, Ef / T).T
+        return b
+
+    def _get_b_stats(self, smooth_dict, control_z):
+        smoothing_density = pdf.GaussianPDF(**smooth_dict)
+        T = smoothing_density.R - 1
+        U = control_z[:T]  # [T, Du]
+
+        Ez = jnp.sum(smoothing_density.integrate("x")[:-1], axis=0)
+        sum_u = jnp.sum(U, axis=0)
+
+        def _ek_one_t(t):
+            u_t = U[t]
+            k_func = self._make_k_func_for_u(u_t)
+            sd_t = smoothing_density.slice(jnp.array([t]))
+            sd_k = sd_t.multiply(k_func, update_full=True)
+            return sd_k.integral_light().reshape((self.Dk,))
+
+        Ek_all = vmap(_ek_one_t)(jnp.arange(T))
+        sum_Ek = jnp.sum(Ek_all, axis=0)
+
+        Ef = jnp.concatenate([Ez, sum_u, sum_Ek])
+        sd_mu = jnp.sum(smoothing_density.mu[1:], axis=0)
+        return jnp.array([T]), Ef, sd_mu
+
+    def _update_Qz(self, smooth_dict, two_step_smooth_dict, control_z):
+        stats = vmap(self._get_Qz_stats)(
+            smooth_dict, two_step_smooth_dict, control_z
+        )
+        T, Qz = self._reduce_batch_dims(stats)
+        return Qz / T
+
+    def _get_Qz_stats(self, smooth_dict, two_step_smooth_dict, control_z):
+        two_step_smoothing_density = pdf.GaussianPDF(**two_step_smooth_dict)
+        T = two_step_smoothing_density.R
+        smoothing_density = pdf.GaussianPDF(**smooth_dict).slice(
+            jnp.arange(T)
+        )
+        U = control_z[:T]
+
+        # Linear part: z_{t+1} - A_z z_t - b
+        A_tilde = jnp.block(
+            [[jnp.eye(self.Dz, self.Dz)], [-self.A_lin_z.T]]
+        )
+        b_tilde = -self.b
+        Qz_lin = jnp.sum(
+            two_step_smoothing_density.integrate(
+                "(Ax+a)(Bx+b)'",
+                A_mat=A_tilde.T,
+                a_vec=b_tilde,
+                B_mat=A_tilde.T,
+                b_vec=b_tilde,
+            ),
+            axis=0,
+        )
+
+        Ez_future_per_t = (
+            pdf.GaussianPDF(**smooth_dict)
+            .slice(jnp.arange(1, T + 1))
+            .integrate("x")
+        )  # [T, Dz]
+        Ez_past_per_t = smoothing_density.integrate("x")  # [T, Dz]
+
+        # Per-timestep kernel stats
+        def _k_stats_one_t(t):
+            u_t = U[t]
+            k_func = self._make_k_func_for_u(u_t)
+            sd_t = smoothing_density.slice(jnp.array([t]))
+            sd_k = sd_t.multiply(k_func, update_full=True)
+            sd_kk = sd_k.multiply(k_func, update_full=True)
+            Ek_t = sd_k.integral_light().reshape((self.Dk,))
+            Ekz_t = sd_k.integrate("x").reshape((self.Dk, self.Dz))
+            Ekk_t = sd_kk.integral_light().reshape((self.Dk, self.Dk))
+            return Ek_t, Ekz_t, Ekk_t
+
+        Ek_all, Ekz_all, Ekk_all = vmap(_k_stats_one_t)(jnp.arange(T))
+
+        # Cross terms with joint density for E[k z_{t+1}]
+        def _cross_k_one_t(t):
+            u_t = U[t]
+            joint_k_func = self._make_joint_k_func_for_u(u_t)
+            ts_t = two_step_smoothing_density.slice(jnp.array([t]))
+            ts_k = ts_t.multiply(joint_k_func, update_full=True)
+            Ekz_joint = ts_k.integrate("x").reshape(
+                (self.Dk, 2 * self.Dz)
+            )
+            return Ekz_joint[:, : self.Dz], Ekz_joint[:, self.Dz :]
+
+        Ek_future_all, Ek_past_all = vmap(_cross_k_one_t)(jnp.arange(T))
+
+        sum_Ek_future = jnp.sum(Ek_future_all, axis=0)
+        sum_Ek_past = jnp.sum(Ek_past_all, axis=0)
+        sum_Ek = jnp.sum(Ek_all, axis=0)
+
+        Qz_k_lin_err = jnp.dot(
+            self.A_k,
+            (
+                sum_Ek_future
+                - jnp.dot(self.A_lin_z, sum_Ek_past.T).T
+                - sum_Ek[:, None] * self.b[None]
+            ),
+        )
+
+        # u cross-terms with linear error
+        u_lin_err = jnp.einsum(
+            "ti,tj->ij",
+            U,
+            Ez_future_per_t
+            - jnp.dot(self.A_lin_z, Ez_past_per_t.T).T
+            - self.b[None],
+        )  # [Du, Dz]
+        Qz_u_lin_err = jnp.dot(self.A_lin_u, u_lin_err)  # [Dz, Dz]
+
+        # u-k cross: A_u @ sum_t u_t E[k_t]' @ A_k'
+        sum_uEk = jnp.einsum("ti,tj->ij", U, Ek_all)  # [Du, Dk]
+        Qz_uk = jnp.dot(jnp.dot(self.A_lin_u, sum_uEk), self.A_k.T)
+
+        # u-u: A_u @ sum_t u_t u_t' @ A_u'
+        sum_uu = jnp.einsum("ti,tj->ij", U, U)
+        Qz_uu = jnp.dot(jnp.dot(self.A_lin_u, sum_uu), self.A_lin_u.T)
+
+        # k-k
+        sum_Ekk = jnp.sum(Ekk_all, axis=0)
+        Qz_kk = jnp.dot(jnp.dot(self.A_k, sum_Ekk), self.A_k.T)
+
+        Qz = (
+            Qz_lin
+            + Qz_kk
+            + Qz_uu
+            - Qz_k_lin_err
+            - Qz_k_lin_err.T
+            - Qz_u_lin_err
+            - Qz_u_lin_err.T
+            + Qz_uk
+            + Qz_uk.T
+        )
+
+        return jnp.array([T]), Qz
+
+    def _update_kernel_params(
+        self, smooth_dict, two_step_smooth_dict, control_z
+    ):
+        """Update kernel weights W [Dk, 1+Dz+Du] via L-BFGS-B."""
+
+        def objective(W, smooth_dict, two_step_smooth_dict, control_z):
+            smoothing_density = pdf.GaussianPDF(**smooth_dict)
+            two_step_smoothing_density = pdf.GaussianPDF(
+                **two_step_smooth_dict
+            )
+            old_W = self.W
+            self.W = W
+            q = self.compute_Q_function(
+                smoothing_density,
+                two_step_smoothing_density,
+                control_z=control_z,
+            )
+            self.W = old_W
+            return -q + 0.5 * self.lambda_W * jnp.sum(W**2)
+
+        batch_objective = (
+            lambda params, sd, tssd, cz: jnp.mean(
+                vmap(
+                    objective,
+                    in_axes=[
+                        None,
+                        {
+                            "Sigma": 0,
+                            "mu": 0,
+                            "Lambda": 0,
+                            "ln_det_Sigma": 0,
+                        },
+                        {
+                            "Sigma": 0,
+                            "mu": 0,
+                            "Lambda": 0,
+                            "ln_det_Sigma": 0,
+                        },
+                        0,
+                    ],
+                )(params, sd, tssd, cz)
+            )
+        )
+        params = self.W
+        result = minimize(
+            batch_objective,
+            params,
+            "L-BFGS-B",
+            args=(smooth_dict, two_step_smooth_dict, control_z),
+        )
+        self.W = result.x
+
+    def get_params(self) -> dict:
+        return {
+            "A": self.A,
+            "b": self.b,
+            "W": self.W,
+            "Lz": self.Lz,
+            "Du": jnp.array(self.Du),
+        }
+
+    @classmethod
+    def from_dict(cls, params: dict):
+        Dz = params["A"].shape[0]
+        Du = int(params["Du"])
+        Dk = params["W"].shape[0]
+        model = cls(Dz=Dz, Du=Du, Dk=Dk)
+        model.A = params["A"]
+        model.b = params["b"]
+        model.W = params["W"]
+        model.Lz = params["Lz"]
+        model.Qz = model.cholvec_to_mat(model.Lz, model.Dz)
+        model.update_state_density()
+        return model
