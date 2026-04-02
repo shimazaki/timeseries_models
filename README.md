@@ -113,6 +113,27 @@ $`k(h) = \exp(-h^2 / 2)`$ and $`h_i(x) = w_i'x + w_{i,0}`$.
 
 The parameters that need to be inferred are $`A, b, \Sigma_z, W`$, where $`W`$ are all the kernel weights.
 
+#### `LSEMExogStateModel`
+
+This extends `LSEMStateModel` to include exogenous inputs $`\mathbf{u}_t`$:
+```math
+\mathbf{z}_t = A_z \mathbf{z}_{t-1} + A_u \mathbf{u}_t + A_k \mathbf{k}(\mathbf{z}_{t-1}, \mathbf{u}_t) + \mathbf{b} + \zeta_t,
+```
+with $`\zeta_t \sim N(0,\Sigma_z)`$. The kernel feature vector is
+```math
+k_i(\mathbf{z}, \mathbf{u}) = \exp\!\bigl(-h_i(\mathbf{z}, \mathbf{u})^2 / 2\bigr), \quad h_i(\mathbf{z}, \mathbf{u}) = \mathbf{w}_i^{z\top} \mathbf{z} + \mathbf{w}_i^{u\top} \mathbf{u} + w_{i,0}.
+```
+Since $`\mathbf{u}_t`$ is observed, each time step reduces to a standard LSEM with time-varying bias $`\mathbf{b}_\text{eff} = \mathbf{b} + A_u \mathbf{u}_t`$ and kernel offset $`\tilde{w}_{i,0} = \mathbf{w}_i^{u\top}\mathbf{u}_t + w_{i,0}`$.
+
+The parameters to be inferred are $`A_z, A_u, A_k, \mathbf{b}, \Sigma_z, W`$. Exogenous inputs are passed via the `control_z` argument to `fit()` and `predict()`.
+
+```python
+sm = state_model.LSEMExogStateModel(Dz=2, Du=2, Dk=3)
+om = observation_model.LinearObservationModel(Dx=4, Dz=2)
+ssm = state_space_model.StateSpaceModel(observation_model=om, state_model=sm)
+ssm.fit(data_train, control_z=exog_input)
+```
+
 #### `LRBFMStateModel`
 
 This implements a linear+radial basis function mean (LRBF) state model     
