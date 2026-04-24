@@ -1618,6 +1618,7 @@ class LSEMExogStateModel(LSEMStateModel):
             params,
             "L-BFGS-B",
             args=(smooth_dict, two_step_smooth_dict, control_z),
+            options={"maxiter": 500},
         )
         self.W = result.x
 
