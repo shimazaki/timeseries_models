@@ -71,23 +71,23 @@ class StateSpaceModel:
         horizon: int = 1,
     ) -> Tuple[jnp.ndarray]:
         assert X.shape[-1] == self.om.Dx
-        assert control_x == None or control_x.ndim == X.ndim
-        assert control_z == None or control_z.ndim == X.ndim
+        assert control_x is None or control_x.ndim == X.ndim
+        assert control_z is None or control_z.ndim == X.ndim
         if X.ndim == 2:
             X = X[None]
-        if control_x == None:
+        if control_x is None:
             control_x = jnp.empty((X.shape[0], X.shape[1] + horizon - 1, 0))
         elif control_x.ndim == 2:
             control_x = control_x[None]
-        if control_z == None:
+        if control_z is None:
             control_z = jnp.empty((X.shape[0], X.shape[1] + horizon - 1, 0))
         elif control_z.ndim == 2:
             control_z = control_x[None]
         assert control_x.shape[1] == (X.shape[1] + horizon - 1)
         assert control_z.shape[1] == (X.shape[1] + horizon - 1)
-        if mu0 == None:
+        if mu0 is None:
             mu0 = jnp.zeros((X.shape[0], 1, self.sm.Dz))
-        if Sigma0 == None:
+        if Sigma0 is None:
             Sigma0 = jnp.tile(jnp.eye(self.sm.Dz)[None, None], (X.shape[0], 1, 1, 1))
         return X, mu0, Sigma0, control_x, control_z
 
