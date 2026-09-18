@@ -16,17 +16,119 @@ Usage:
     smooth = ssm.smooth(X, mask)  # smoothed latent density dict
 """
 from typing import Tuple
+import time
 
 import jax
 from jax import lax, jit, vmap, pmap
 import jax.numpy as jnp
 import numpy as np
+from scipy.optimize import minimize as scipy_minimize
 from tqdm import tqdm
 
 from gaussian_toolbox import pdf
-from timeseries_models import observation_model, state_space_model
+from timeseries_models import observation_model, state_model, state_space_model
 
 QX_FLOOR = 1e-6
+_DICT_AXES = {"Sigma": 0, "mu": 0, "Lambda": 0, "ln_det_Sigma": 0}
+
+
+def _shard_batch(arrs, n_dev):
+    """Split leading batch axis across devices; returns sharded arrays and
+    per-window weights (0 for padding copies)."""
+    B = jax.tree_util.tree_leaves(arrs[0])[0].shape[0]
+    pad = (-B) % n_dev
+    w = jnp.concatenate([jnp.ones(B), jnp.zeros(pad)]).reshape(n_dev, -1)
+
+    def shard(a):
+        if pad:
+            a = jnp.concatenate([a, jnp.repeat(a[-1:], pad, axis=0)])
+        return a.reshape((n_dev, (B + pad) // n_dev) + a.shape[1:])
+    return [jax.tree_util.tree_map(shard, a) for a in arrs], w, B
+
+
+class ShardedLSEMStateModel(state_model.LSEMStateModel):
+    """LSEM state model whose M-step sufficient statistics and kernel-weight
+    objective are computed data-parallel over local devices (windows are
+    independent given the parameters).
+
+    `kernel_maxiter` bounds the L-BFGS-B iterations of the kernel-weight update
+    per EM step (a partial M-step still yields a generalized EM)."""
+    kernel_maxiter = 100
+
+    def _sharded_sum(self, stats_fn, *dicts):
+        n_dev = jax.local_device_count()
+        B = dicts[0]["mu"].shape[0]
+        if n_dev == 1 or B < n_dev:
+            return [jnp.sum(a, axis=0) for a in jit(vmap(stats_fn))(*dicts)]
+        sh, w, _ = _shard_batch(dicts, n_dev)
+        axes = [_DICT_AXES] * len(dicts) + [0]
+
+        def per_device(*args):
+            *ds, w_d = args
+            out = vmap(lambda *a: [x * a[-1] for x in stats_fn(*a[:-1])],
+                       in_axes=axes)(*ds, w_d)
+            return [jnp.sum(x, axis=0) for x in out]
+        out = pmap(per_device)(*sh, w)
+        return [jnp.sum(x, axis=0) for x in out]
+
+    def _update_A(self, smooth_dict, two_step_smooth_dict):
+        T, Eff, Ezf, Ef = self._sharded_sum(self._get_A_stats, smooth_dict,
+                                            two_step_smooth_dict)
+        Ebf = (Ef[None] * self.b[:, None]) / T
+        return jnp.linalg.solve(Eff / T, (Ezf - Ebf).T / T).T
+
+    def _update_b(self, smooth_dict):
+        T, Ef, sd_mu = self._sharded_sum(self._get_b_stats, smooth_dict)
+        return sd_mu / T - jnp.dot(self.A, Ef / T).T
+
+    def _update_Qz(self, smooth_dict, two_step_smooth_dict, **kwargs):
+        T, Qz = self._sharded_sum(self._get_Qz_stats, smooth_dict,
+                                  two_step_smooth_dict)
+        return Qz / T
+
+    def update_hyperparameters(self, smooth_dict, two_step_smooth_dict, **kwargs):
+        self.A = self._update_A(smooth_dict, two_step_smooth_dict)
+        self.Qz = self._update_Qz(smooth_dict, two_step_smooth_dict)
+        self.Lz = self.mat_to_cholvec(self.Qz)
+        self.b = self._update_b(smooth_dict)
+        self.update_state_density()
+        self._update_kernel_params(smooth_dict, two_step_smooth_dict)
+        self.update_state_density()
+
+    def _update_kernel_params(self, smooth_dict, two_step_smooth_dict):
+        n_dev = jax.local_device_count()
+        B = smooth_dict["mu"].shape[0]
+        if n_dev == 1 or B < n_dev:
+            return super()._update_kernel_params(smooth_dict, two_step_smooth_dict)
+        (sd, tsd), w, B = _shard_batch([smooth_dict, two_step_smooth_dict], n_dev)
+
+        def objective(W, sd_i, tsd_i, w_i):
+            self.state_density.w0 = W[:, 0]
+            self.state_density.W = W[:, 1:]
+            self.state_density.update_phi()
+            return -w_i * self.compute_Q_function(pdf.GaussianPDF(**sd_i),
+                                                 pdf.GaussianPDF(**tsd_i))
+
+        def per_device(W, sd_d, tsd_d, w_d):
+            return jnp.sum(vmap(objective, in_axes=[None, _DICT_AXES,
+                                                    _DICT_AXES, 0])(W, sd_d, tsd_d, w_d))
+        # pmap must stay outermost (pmap inside jit does not lower), so value
+        # and gradient are computed per device and reduced on the host before
+        # being handed to scipy's L-BFGS-B.
+        p_vg = pmap(jax.value_and_grad(per_device))
+        shape, lam = self.W.shape, self.lambda_W
+
+        def fun_jac(W_flat):
+            W = jnp.asarray(W_flat, dtype=jnp.float32).reshape(shape)
+            W_b = jnp.broadcast_to(W, (n_dev,) + shape)
+            vals, grads = p_vg(W_b, sd, tsd, w)
+            f = float(jnp.sum(vals)) / B + 0.5 * lam * float(jnp.sum(W ** 2))
+            g = np.asarray(jnp.sum(grads, axis=0)) / B + lam * np.asarray(W)
+            return f, g.ravel().astype(np.float64)
+        res = scipy_minimize(fun_jac, np.asarray(self.W, dtype=np.float64).ravel(),
+                             jac=True, method="L-BFGS-B",
+                             options={"maxiter": self.kernel_maxiter})
+        self.W = jnp.asarray(res.x.reshape(shape), dtype=jnp.float32)
 
 
 def _logdet_psd(M):
@@ -190,15 +292,25 @@ class MaskedStateSpaceModel(state_space_model.StateSpaceModel):
         X, mask, mu0, Sigma0, control_z = self._init_masked(X, mask)
         llk_list = []
         converged, it = False, 0
+        self.timing = {"estep": 0.0, "mstep_sm": 0.0, "mstep_om": 0.0, "llk": 0.0}
         pbar = tqdm(total=max_iter, desc="EM (masked)", disable=not progress,
                     dynamic_ncols=True)
         while it < max_iter and not converged:
+            t0 = time.perf_counter()
             smooth, two_step = self.estep_masked(X, mask, mu0, Sigma0, control_z)
+            smooth["mu"].block_until_ready()
+            self.timing["estep"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
             self.sm.update_hyperparameters(smooth, two_step, control_z=control_z)
+            self.timing["mstep_sm"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
             self.om.update_hyperparameters(X, smooth, mask=mask)
+            self.timing["mstep_om"] += time.perf_counter() - t0
             mu0, Sigma0 = smooth["mu"][:, :1], smooth["Sigma"][:, :1]
+            t0 = time.perf_counter()
             llk = float(self.compute_predictive_log_likelihood(
                 X, mask, mu0, Sigma0))
+            self.timing["llk"] += time.perf_counter() - t0
             llk_list.append(llk)
             if it > 2:
                 converged = bool(self._check_convergence(
