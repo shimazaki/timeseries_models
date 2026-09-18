@@ -17,7 +17,8 @@ Usage:
 """
 from typing import Tuple
 
-from jax import lax, jit, vmap
+import jax
+from jax import lax, jit, vmap, pmap
 import jax.numpy as jnp
 import numpy as np
 from tqdm import tqdm
@@ -165,7 +166,23 @@ class MaskedStateSpaceModel(state_space_model.StateSpaceModel):
         return self._backward_sweep(X, filter_dict, control_z)
 
     def estep_masked(self, X, mask, mu0, Sigma0, control_z):
-        return jit(vmap(self._estep_masked))(X, mask, mu0, Sigma0, control_z)
+        """E-step over the batch; data-parallel over all local JAX devices
+        (windows are independent given the parameters). On CPU, expose one
+        device per core with XLA_FLAGS=--xla_force_host_platform_device_count=N."""
+        n_dev = jax.local_device_count()
+        B = X.shape[0]
+        if n_dev == 1 or B < n_dev:
+            return jit(vmap(self._estep_masked))(X, mask, mu0, Sigma0, control_z)
+        pad = (-B) % n_dev
+        def shard(a):
+            if pad:
+                a = jnp.concatenate([a, jnp.repeat(a[-1:], pad, axis=0)])
+            return a.reshape((n_dev, (B + pad) // n_dev) + a.shape[1:])
+        args = [shard(a) for a in (X, mask, mu0, Sigma0, control_z)]
+        smooth, two_step = pmap(vmap(self._estep_masked))(*args)
+        unshard = lambda d: {k: v.reshape((-1,) + v.shape[2:])[:B]
+                             for k, v in d.items()}
+        return unshard(smooth), unshard(two_step)
 
     # ---- fit --------------------------------------------------------------
     def fit(self, X, mask=None, max_iter: int = 100, conv_crit: float = 1e-3,
@@ -212,8 +229,18 @@ class MaskedStateSpaceModel(state_space_model.StateSpaceModel):
     def compute_predictive_log_likelihood(self, X, mask=None, mu0=None,
                                           Sigma0=None, **kwargs):
         X, mask, mu0, Sigma0, _ = self._init_masked(X, mask, mu0, Sigma0)
-        llk = jit(vmap(self._predictive_llk_single))(X, mask, mu0, Sigma0)
-        return jnp.sum(llk)
+        n_dev, B = jax.local_device_count(), X.shape[0]
+        if n_dev == 1 or B < n_dev:
+            return jnp.sum(jit(vmap(self._predictive_llk_single))(
+                X, mask, mu0, Sigma0))
+        pad = (-B) % n_dev
+        def shard(a):
+            if pad:
+                a = jnp.concatenate([a, jnp.repeat(a[-1:], pad, axis=0)])
+            return a.reshape((n_dev, (B + pad) // n_dev) + a.shape[1:])
+        llk = pmap(vmap(self._predictive_llk_single))(
+            *[shard(a) for a in (X, mask, mu0, Sigma0)])
+        return jnp.sum(llk.reshape(-1)[:B])
 
     def smooth(self, X, mask=None, mu0=None, Sigma0=None):
         X, mask, mu0, Sigma0, control_z = self._init_masked(X, mask, mu0, Sigma0)
