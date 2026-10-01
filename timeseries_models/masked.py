@@ -72,9 +72,15 @@ class ShardedLSEMStateModel(state_model.LSEMStateModel):
         return [jnp.sum(x, axis=0) for x in out]
 
     def _update_A(self, smooth_dict, two_step_smooth_dict):
+        """Data-parallel version of LSEMStateModel._update_A; it must reproduce it
+        exactly (test_masked_ssm.TestShardedMStep). The M-step maximiser with b held
+        fixed is A = (sum_t E[z_t f'] - b sum_t E[f]') (sum_t E[ff'])^-1, so the offset
+        term is NOT divided by T, and the kernel block of E[ff'] carries the same ridge
+        as the parent."""
         T, Eff, Ezf, Ef = self._sharded_sum(self._get_A_stats, smooth_dict,
                                             two_step_smooth_dict)
-        Ebf = (Ef[None] * self.b[:, None]) / T
+        Ebf = Ef[None] * self.b[:, None]
+        Eff = Eff.at[self.Dz:, self.Dz:].add(1e-4 * jnp.eye(self.Dk))
         return jnp.linalg.solve(Eff / T, (Ezf - Ebf).T / T).T
 
     def _update_b(self, smooth_dict):
