@@ -29,7 +29,16 @@ from gaussian_toolbox import pdf
 from timeseries_models import observation_model, state_model, state_space_model
 
 QX_FLOOR = 1e-6
-_DICT_AXES = {"Sigma": 0, "mu": 0, "Lambda": 0, "ln_det_Sigma": 0}
+_DICT_AXES = {"Sigma": 0, "mu": 0, "Lambda": 0, "ln_det_Sigma": 0}   # kept for callers; prefer _axes()
+
+
+def _axes(d):
+    """vmap in_axes for a density dict: batch every key the dict actually has.
+
+    A fixed key list breaks on dicts that carry only mu and Sigma (a Gaussian is fully
+    determined by those two; the other entries are caches), and vmap requires in_axes to
+    be a tree PREFIX, so extra keys are an error rather than being ignored."""
+    return {k: 0 for k in d}
 
 
 def _shard_batch(arrs, n_dev):
@@ -47,94 +56,87 @@ def _shard_batch(arrs, n_dev):
 
 
 class ShardedLSEMStateModel(state_model.LSEMStateModel):
-    """LSEM state model whose M-step sufficient statistics and kernel-weight
-    objective are computed data-parallel over local devices (windows are
-    independent given the parameters).
+    """LSEM state model whose kernel-weight M-step runs data-parallel over the local
+    devices (windows are independent given the parameters).
 
-    `kernel_maxiter` bounds the L-BFGS-B iterations of the kernel-weight update
-    per EM step (a partial M-step still yields a generalized EM)."""
+    ONLY the iterative part of the M-step is overridden. The closed-form updates of A,
+    b and Qz are inherited from LSEMStateModel unchanged, so each formula exists in
+    exactly one place. An earlier version re-implemented them alongside the sharding
+    and drifted from the parent (the offset term was divided by T and the ridge on the
+    kernel block was dropped), which made EM non-monotone; `test_masked_ssm.TestShardedMStep`
+    now pins the equivalence.
+
+    `kernel_maxiter` bounds the L-BFGS-B iterations of the kernel-weight update per EM
+    step. A partial M-step still yields a generalized EM, but it is a deliberate
+    departure from the parent, which runs L-BFGS-B to convergence; set it high when the
+    two are to be compared.
+    """
+
     kernel_maxiter = 100
-
-    def _sharded_sum(self, stats_fn, *dicts):
-        n_dev = jax.local_device_count()
-        B = dicts[0]["mu"].shape[0]
-        if n_dev == 1 or B < n_dev:
-            return [jnp.sum(a, axis=0) for a in jit(vmap(stats_fn))(*dicts)]
-        sh, w, _ = _shard_batch(dicts, n_dev)
-        axes = [_DICT_AXES] * len(dicts) + [0]
-
-        def per_device(*args):
-            *ds, w_d = args
-            out = vmap(lambda *a: [x * a[-1] for x in stats_fn(*a[:-1])],
-                       in_axes=axes)(*ds, w_d)
-            return [jnp.sum(x, axis=0) for x in out]
-        out = pmap(per_device)(*sh, w)
-        return [jnp.sum(x, axis=0) for x in out]
-
-    def _update_A(self, smooth_dict, two_step_smooth_dict):
-        """Data-parallel version of LSEMStateModel._update_A; it must reproduce it
-        exactly (test_masked_ssm.TestShardedMStep). The M-step maximiser with b held
-        fixed is A = (sum_t E[z_t f'] - b sum_t E[f]') (sum_t E[ff'])^-1, so the offset
-        term is NOT divided by T, and the kernel block of E[ff'] carries the same ridge
-        as the parent."""
-        T, Eff, Ezf, Ef = self._sharded_sum(self._get_A_stats, smooth_dict,
-                                            two_step_smooth_dict)
-        Ebf = Ef[None] * self.b[:, None]
-        Eff = Eff.at[self.Dz:, self.Dz:].add(1e-4 * jnp.eye(self.Dk))
-        return jnp.linalg.solve(Eff / T, (Ezf - Ebf).T / T).T
-
-    def _update_b(self, smooth_dict):
-        T, Ef, sd_mu = self._sharded_sum(self._get_b_stats, smooth_dict)
-        return sd_mu / T - jnp.dot(self.A, Ef / T).T
-
-    def _update_Qz(self, smooth_dict, two_step_smooth_dict, **kwargs):
-        T, Qz = self._sharded_sum(self._get_Qz_stats, smooth_dict,
-                                  two_step_smooth_dict)
-        return Qz / T
-
-    def update_hyperparameters(self, smooth_dict, two_step_smooth_dict, **kwargs):
-        self.A = self._update_A(smooth_dict, two_step_smooth_dict)
-        self.Qz = self._update_Qz(smooth_dict, two_step_smooth_dict)
-        self.Lz = self.mat_to_cholvec(self.Qz)
-        self.b = self._update_b(smooth_dict)
-        self.update_state_density()
-        self._update_kernel_params(smooth_dict, two_step_smooth_dict)
-        self.update_state_density()
 
     def _update_kernel_params(self, smooth_dict, two_step_smooth_dict):
         n_dev = jax.local_device_count()
         B = smooth_dict["mu"].shape[0]
         if n_dev == 1 or B < n_dev:
-            return super()._update_kernel_params(smooth_dict, two_step_smooth_dict)
+            return self._update_kernel_params_single(smooth_dict, two_step_smooth_dict)
         (sd, tsd), w, B = _shard_batch([smooth_dict, two_step_smooth_dict], n_dev)
 
-        def objective(W, sd_i, tsd_i, w_i):
-            self.state_density.w0 = W[:, 0]
-            self.state_density.W = W[:, 1:]
-            self.state_density.update_phi()
-            return -w_i * self.compute_Q_function(pdf.GaussianPDF(**sd_i),
-                                                 pdf.GaussianPDF(**tsd_i))
-
         def per_device(W, sd_d, tsd_d, w_d):
-            return jnp.sum(vmap(objective, in_axes=[None, _DICT_AXES,
-                                                    _DICT_AXES, 0])(W, sd_d, tsd_d, w_d))
-        # pmap must stay outermost (pmap inside jit does not lower), so value
-        # and gradient are computed per device and reduced on the host before
-        # being handed to scipy's L-BFGS-B.
+            return jnp.sum(vmap(self._neg_Q_one_window,
+                                in_axes=[None, _axes(sd_d), _axes(tsd_d), 0])(W, sd_d, tsd_d, w_d))
+
+        # pmap must stay outermost (pmap inside jit does not lower), so value and
+        # gradient are computed per device and reduced on the host before being handed
+        # to scipy's L-BFGS-B.
         p_vg = pmap(jax.value_and_grad(per_device))
-        shape, lam, dtype = self.W.shape, self.lambda_W, self.W.dtype
 
         def fun_jac(W_flat):
-            W = jnp.asarray(W_flat, dtype=dtype).reshape(shape)
-            W_b = jnp.broadcast_to(W, (n_dev,) + shape)
-            vals, grads = p_vg(W_b, sd, tsd, w)
-            f = float(jnp.sum(vals)) / B + 0.5 * lam * float(jnp.sum(W ** 2))
-            g = np.asarray(jnp.sum(grads, axis=0)) / B + lam * np.asarray(W)
+            W = jnp.asarray(W_flat, dtype=self.W.dtype).reshape(self.W.shape)
+            vals, grads = p_vg(jnp.broadcast_to(W, (n_dev,) + self.W.shape), sd, tsd, w)
+            f = float(jnp.sum(vals)) / B + 0.5 * self.lambda_W * float(jnp.sum(W ** 2))
+            g = np.asarray(jnp.sum(grads, axis=0)) / B + self.lambda_W * np.asarray(W)
             return f, g.ravel().astype(np.float64)
+
+        self._run_lbfgs(fun_jac)
+
+    def _update_kernel_params_single(self, smooth_dict, two_step_smooth_dict):
+        """One-device path. Same objective and same stopping rule as the sharded path,
+        so a result does not depend on how many devices happened to be visible."""
+        w = jnp.ones(smooth_dict["mu"].shape[0])
+
+        def total(W):
+            return jnp.sum(vmap(self._neg_Q_one_window,
+                                in_axes=[None, _axes(smooth_dict), _axes(two_step_smooth_dict), 0])(
+                W, smooth_dict, two_step_smooth_dict, w))
+
+        vg = jit(jax.value_and_grad(total))
+        B = float(smooth_dict["mu"].shape[0])
+
+        def fun_jac(W_flat):
+            W = jnp.asarray(W_flat, dtype=self.W.dtype).reshape(self.W.shape)
+            val, grad = vg(W)
+            f = float(val) / B + 0.5 * self.lambda_W * float(jnp.sum(W ** 2))
+            g = np.asarray(grad) / B + self.lambda_W * np.asarray(W)
+            return f, g.ravel().astype(np.float64)
+
+        self._run_lbfgs(fun_jac)
+
+    def _neg_Q_one_window(self, W, sd_i, tsd_i, weight):
+        """Negative Q-function of one window under kernel weights W, times `weight`
+        (0 for the padding copies a shard may carry). This is the parent's objective:
+        LSEMStateModel._update_kernel_params minimises its mean over windows."""
+        self.state_density.w0 = W[:, 0]
+        self.state_density.W = W[:, 1:]
+        self.state_density.update_phi()
+        return -weight * self.compute_Q_function(pdf.GaussianPDF(**sd_i),
+                                                 pdf.GaussianPDF(**tsd_i))
+
+    def _run_lbfgs(self, fun_jac):
         res = scipy_minimize(fun_jac, np.asarray(self.W, dtype=np.float64).ravel(),
                              jac=True, method="L-BFGS-B",
                              options={"maxiter": self.kernel_maxiter})
-        self.W = jnp.asarray(res.x.reshape(shape), dtype=dtype)
+        self.W = jnp.asarray(res.x.reshape(self.W.shape), dtype=self.W.dtype)
+        self.update_state_density()
 
 
 def _logdet_psd(M):
@@ -367,7 +369,7 @@ class MaskedLSEMObservationModel(observation_model.LSEMObservationModel):
             return w_i * 0.5 * jnp.sum(q / qx)
 
         def per_device(W, sd_d, X_d, M_d, w_d):
-            return jnp.sum(vmap(per_window, in_axes=[None, _DICT_AXES, 0, 0, 0])(
+            return jnp.sum(vmap(per_window, in_axes=[None, _axes(sd_d), 0, 0, 0])(
                 W, sd_d, X_d, M_d, w_d))
         p_vg = pmap(jax.value_and_grad(per_device))
         W0 = jnp.concatenate([self.observation_density.w0[:, None],
