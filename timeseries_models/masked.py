@@ -104,17 +104,19 @@ class ShardedLSEMStateModel(state_model.LSEMStateModel):
         so a result does not depend on how many devices happened to be visible."""
         w = jnp.ones(smooth_dict["mu"].shape[0])
 
-        def total(W):
+        # The smoothing densities are passed as ARGUMENTS, never closed over: a jitted function
+        # embeds captured arrays as constants, and at the real data size (the two-step
+        # covariances alone are ~3 GB) that made every EM iteration several times slower.
+        def total(W, sd, tsd, w):
             return jnp.sum(vmap(self._neg_Q_one_window,
-                                in_axes=[None, _axes(smooth_dict), _axes(two_step_smooth_dict), 0])(
-                W, smooth_dict, two_step_smooth_dict, w))
+                                in_axes=[None, _axes(sd), _axes(tsd), 0])(W, sd, tsd, w))
 
         vg = jit(jax.value_and_grad(total))
         B = float(smooth_dict["mu"].shape[0])
 
         def fun_jac(W_flat):
             W = jnp.asarray(W_flat, dtype=self.W.dtype).reshape(self.W.shape)
-            val, grad = vg(W)
+            val, grad = vg(W, smooth_dict, two_step_smooth_dict, w)
             f = float(val) / B + 0.5 * self.lambda_W * float(jnp.sum(W ** 2))
             g = np.asarray(grad) / B + self.lambda_W * np.asarray(W)
             return f, g.ravel().astype(np.float64)
