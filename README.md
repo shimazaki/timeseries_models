@@ -32,6 +32,11 @@ These can then be combined in a [state-space model](https://github.com/christian
 
 The state-space model can then be learnt via an (approximate) expectation maximization algorithm. 
 
+For nonlinear models, an increase in the M-step Q function does not guarantee
+an increase in the moment-matched predictive log likelihood. See
+[EM diagnostics and a counterexample](docs/approximate_em.md) for the distinction
+and what to monitor.
+
 # Example code
 
 First we construct the state space model.

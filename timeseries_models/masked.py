@@ -331,6 +331,10 @@ class MaskedLSEMObservationModel(observation_model.LSEMObservationModel):
 
     def _masked_quadratic(self, Ef, Eff, Xm, mask, Cd):
         """sum_t m_ti E[(x_ti - cd_i' phi~_t)^2] for every observation dim i."""
+        # Observations may be stored in float32 while the model is float64.
+        # Promote before squaring: otherwise the low-precision sum of x**2
+        # can dominate the small residual left after subtracting the cross terms.
+        Xm = jnp.asarray(Xm, dtype=jnp.result_type(Xm, Ef, Eff, Cd))
         lin = jnp.einsum("bti,btj,ij->i", Xm, Ef, Cd)
         quad = jnp.einsum("bti,ij,btjk,ik->i", mask, Cd, Eff, Cd)
         return jnp.sum(Xm ** 2, axis=(0, 1)) - 2.0 * lin + quad
